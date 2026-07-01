@@ -1,0 +1,6 @@
+{
+  "name": "GAMESITEONLINE",
+  "description": "A neo-brutalist game distribution platform with bilingual English and Kiswahili support. Browse, search, filter, and download games from a curated database.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
