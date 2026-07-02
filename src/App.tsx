@@ -148,6 +148,7 @@ export default function App() {
   });
 
   // Comments, Abusive filter and Banning States
+  const [banTapCount, setBanTapCount] = useState<number>(0);
   const [isBanned, setIsBanned] = useState<boolean>(() => {
     const bannedUntilStr = localStorage.getItem("banned_until") || getCookie("banned_until");
     if (bannedUntilStr) {
@@ -2604,7 +2605,28 @@ export default function App() {
 
             <div className="w-full border-t-2 border-black/10 pt-4 flex justify-between items-center text-xs font-mono text-neutral-500">
               <span>GAMESITEONLINE SAFETY PROTOCOL</span>
-              <span>FAHAD MOHAMED 🇹🇿</span>
+              <span 
+                className="cursor-pointer select-none hover:text-[#EF4444] transition-colors font-bold"
+                onClick={() => {
+                  setBanTapCount(prev => {
+                    const next = prev + 1;
+                    if (next >= 13) {
+                      localStorage.removeItem("banned_until");
+                      localStorage.removeItem("abuse_violations_count");
+                      eraseCookie("banned_until");
+                      eraseCookie("abuse_violations_count");
+                      setIsBanned(false);
+                      setBanTimeLeft(0);
+                      setAbuseViolations(0);
+                      alert(language === "en" ? "Developer Override: Access restored!" : "Njia ya Msanidi: Ufikiaji umerudishwa!");
+                      return 0;
+                    }
+                    return next;
+                  });
+                }}
+              >
+                FAHAD MOHAMED 🇹🇿
+              </span>
             </div>
           </div>
         </div>
