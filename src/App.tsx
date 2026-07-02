@@ -53,6 +53,32 @@ const ABUSIVE_WORDS = [
   "pussy", "faggot", "nigger", "slut", "whore"
 ];
 
+// Real-time cookie helpers
+const getCookie = (name: string): string | null => {
+  const nameEQ = name + "=";
+  const ca = document.cookie.split(';');
+  for (let i = 0; i < ca.length; i++) {
+    let c = ca[i];
+    while (c.charAt(0) === ' ') c = c.substring(1, c.length);
+    if (c.indexOf(nameEQ) === 0) return c.substring(nameEQ.length, c.length);
+  }
+  return null;
+};
+
+const setCookie = (name: string, value: string, days?: number) => {
+  let expires = "";
+  if (days) {
+    const date = new Date();
+    date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+    expires = "; expires=" + date.toUTCString();
+  }
+  document.cookie = name + "=" + (value || "") + expires + "; path=/; SameSite=Lax";
+};
+
+const eraseCookie = (name: string) => {
+  document.cookie = name + '=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax';
+};
+
 const sanitizeCommentText = (text: string): string => {
   let sanitized = text;
   ABUSIVE_WORDS.forEach(word => {
@@ -116,9 +142,14 @@ export default function App() {
     githubConfigured: false
   });
 
+  const [showPrivacyModal, setShowPrivacyModal] = useState<boolean>(false);
+  const [showCookieBanner, setShowCookieBanner] = useState<boolean>(() => {
+    return !getCookie("cookie_consent");
+  });
+
   // Comments, Abusive filter and Banning States
   const [isBanned, setIsBanned] = useState<boolean>(() => {
-    const bannedUntilStr = localStorage.getItem("banned_until");
+    const bannedUntilStr = localStorage.getItem("banned_until") || getCookie("banned_until");
     if (bannedUntilStr) {
       const bannedUntil = parseInt(bannedUntilStr, 10);
       return bannedUntil > Date.now();
@@ -148,7 +179,7 @@ export default function App() {
   const [isFalizMinimized, setIsFalizMinimized] = useState<boolean>(false);
 
   const [abuseViolations, setAbuseViolations] = useState<number>(() => {
-    const stored = localStorage.getItem("abuse_violations_count");
+    const stored = localStorage.getItem("abuse_violations_count") || getCookie("abuse_violations_count");
     return stored ? parseInt(stored, 10) : 0;
   });
 
@@ -242,21 +273,36 @@ export default function App() {
   // Ban timer checking effect
   useEffect(() => {
     const checkAndTick = () => {
-      const bannedUntilStr = localStorage.getItem("banned_until");
+      const bannedUntilStr = localStorage.getItem("banned_until") || getCookie("banned_until");
       if (bannedUntilStr) {
         const bannedUntil = parseInt(bannedUntilStr, 10);
         const now = Date.now();
         if (bannedUntil > now) {
           setIsBanned(true);
           setBanTimeLeft(Math.ceil((bannedUntil - now) / 1000));
+          // Synchronize cookies and localStorage
+          if (!localStorage.getItem("banned_until")) {
+            localStorage.setItem("banned_until", bannedUntilStr);
+          }
+          if (!getCookie("banned_until")) {
+            setCookie("banned_until", bannedUntilStr, 1);
+          }
         } else {
           localStorage.removeItem("banned_until");
           localStorage.removeItem("abuse_violations_count");
+          eraseCookie("banned_until");
+          eraseCookie("abuse_violations_count");
           setIsBanned(false);
           setBanTimeLeft(0);
           setAbuseViolations(0);
         }
       } else {
+        // Double check cookie just in case
+        const cookieBan = getCookie("banned_until");
+        if (cookieBan) {
+          localStorage.setItem("banned_until", cookieBan);
+          return;
+        }
         setIsBanned(false);
         setBanTimeLeft(0);
       }
@@ -358,7 +404,15 @@ export default function App() {
       alert(language === "en" ? "Please sign in to comment!" : "Tafadhali ingia ili kuandika maoni!");
       return;
     }
-    if (isBanned) return;
+    
+    // Double check ban status in both localStorage and cookies
+    const cookieBan = getCookie("banned_until");
+    const localBan = localStorage.getItem("banned_until");
+    if (cookieBan || localBan || isBanned) {
+      setIsBanned(true);
+      alert(language === "en" ? "You are currently banned from posting comments!" : "Umezuiwa kutuma maoni kwa sasa!");
+      return;
+    }
 
     const trimmedText = commentText.trim();
     if (!trimmedText) return;
@@ -371,14 +425,17 @@ export default function App() {
     });
 
     if (hasAbuse) {
-      const newViolations = abuseViolations + 1;
+      const currentStoredViolations = parseInt(localStorage.getItem("abuse_violations_count") || getCookie("abuse_violations_count") || "0", 10);
+      const newViolations = currentStoredViolations + 1;
       setAbuseViolations(newViolations);
       localStorage.setItem("abuse_violations_count", newViolations.toString());
+      setCookie("abuse_violations_count", newViolations.toString(), 1);
 
       if (newViolations >= 3) {
         // Ban for 1 hour
         const bannedUntil = Date.now() + 3600 * 1000;
         localStorage.setItem("banned_until", bannedUntil.toString());
+        setCookie("banned_until", bannedUntil.toString(), 1);
         setIsBanned(true);
         setBanTimeLeft(3600);
         setCommentText("");
@@ -426,7 +483,15 @@ export default function App() {
       alert(language === "en" ? "Please sign in to reply!" : "Tafadhali ingia ili ujibu!");
       return;
     }
-    if (isBanned) return;
+    
+    // Double check ban status in both localStorage and cookies
+    const cookieBan = getCookie("banned_until");
+    const localBan = localStorage.getItem("banned_until");
+    if (cookieBan || localBan || isBanned) {
+      setIsBanned(true);
+      alert(language === "en" ? "You are currently banned from posting comments!" : "Umezuiwa kutuma maoni kwa sasa!");
+      return;
+    }
 
     const trimmedText = replyText.trim();
     if (!trimmedText) return;
@@ -439,14 +504,17 @@ export default function App() {
     });
 
     if (hasAbuse) {
-      const newViolations = abuseViolations + 1;
+      const currentStoredViolations = parseInt(localStorage.getItem("abuse_violations_count") || getCookie("abuse_violations_count") || "0", 10);
+      const newViolations = currentStoredViolations + 1;
       setAbuseViolations(newViolations);
       localStorage.setItem("abuse_violations_count", newViolations.toString());
+      setCookie("abuse_violations_count", newViolations.toString(), 1);
 
       if (newViolations >= 3) {
         // Ban for 1 hour
         const bannedUntil = Date.now() + 3600 * 1000;
         localStorage.setItem("banned_until", bannedUntil.toString());
+        setCookie("banned_until", bannedUntil.toString(), 1);
         setIsBanned(true);
         setBanTimeLeft(3600);
         setReplyText("");
@@ -2278,6 +2346,176 @@ export default function App() {
             )}
           </AnimatePresence>
 
+          {/* PRIVACY POLICY & COOKIES MODAL */}
+          <AnimatePresence>
+            {showPrivacyModal && (
+              <motion.div
+                id="privacy-modal-overlay"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 bg-[#00000095] z-50 flex items-center justify-center p-4 backdrop-blur-xs"
+              >
+                <motion.div
+                  id="privacy-modal-content"
+                  initial={{ scale: 0.9, y: 50 }}
+                  animate={{ scale: 1, y: 0 }}
+                  exit={{ scale: 0.9, y: 50 }}
+                  transition={{ type: "spring", damping: 15 }}
+                  className="w-full max-w-2xl bg-white text-black neo-border p-6 sm:p-8 neo-shadow-lg relative max-h-[90vh] overflow-y-auto"
+                >
+                  <button
+                    onClick={() => setShowPrivacyModal(false)}
+                    className="absolute top-4 right-4 bg-white hover:bg-neutral-50 neo-border-sm p-1.5 neo-shadow-sm neo-shadow-hover cursor-pointer z-10"
+                    aria-label="Close Privacy Policy"
+                  >
+                    <X className="w-5 h-5 text-black" />
+                  </button>
+
+                  <div className="flex items-center gap-3 mb-6 pb-2 border-b-4 border-black">
+                    <FileCode className="w-6 h-6 text-[#F97316]" />
+                    <h2 className="text-2xl font-black uppercase tracking-tight">
+                      PRIVACY POLICY & COOKIES
+                    </h2>
+                  </div>
+
+                  <div className="space-y-6 text-sm leading-relaxed text-neutral-800 text-left">
+                    <div className="bg-[#FFFCE5] neo-border p-4 font-mono text-xs space-y-2">
+                      <p className="font-extrabold uppercase text-yellow-950">🔒 TANZANIAN DATA PROTECTION PROTOCOL</p>
+                      <p>Designed and managed by <strong>Fahad Mohamed</strong> in Tanzania 🇹🇿. We value your safety and manage your data with strict confidentiality in full compliance with local and international guidelines.</p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <h3 className="font-mono text-xs font-black uppercase tracking-wider text-black">
+                        1. REAL-TIME COOKIES USAGE
+                      </h3>
+                      <p className="text-xs text-neutral-600">
+                        Our application utilizes cookies and client storage in real-time to optimize operations:
+                      </p>
+                      <ul className="list-disc pl-5 text-xs text-neutral-600 space-y-1">
+                        <li><strong>cookie_consent</strong>: Remembers your privacy choices and banner consent.</li>
+                        <li><strong>banned_until</strong>: Active ban timestamp tracking to block abusive users across all tabs and browser instances in real-time.</li>
+                        <li><strong>abuse_violations_count</strong>: Records the number of times harmful or abusive terms have been inputted to protect community harmony.</li>
+                        <li><strong>gamesite_lang</strong>: Remembers your language configuration preference.</li>
+                      </ul>
+                    </div>
+
+                    <div className="space-y-2">
+                      <h3 className="font-mono text-xs font-black uppercase tracking-wider text-black">
+                        2. ABUSE & SPAM FILTERING SYSTEM
+                      </h3>
+                      <p className="text-xs text-neutral-600">
+                        To maintain a family-safe retro community, all comments and replies undergo real-time local filtering. If abusive words or malicious inputs are detected:
+                      </p>
+                      <ul className="list-disc pl-5 text-xs text-neutral-600 space-y-1">
+                        <li>The comment is immediately blocked.</li>
+                        <li>A violation counter increments in both your cookies and local storage.</li>
+                        <li>Upon reaching 3 violations, you will be temporarily banned for 1 hour. This ban status is validated in real-time using cookie checks.</li>
+                      </ul>
+                    </div>
+
+                    <div className="space-y-2">
+                      <h3 className="font-mono text-xs font-black uppercase tracking-wider text-black">
+                        3. DATA PERSISTENCE & PRIVACY
+                      </h3>
+                      <p className="text-xs text-neutral-600">
+                        Authentication is processed securely via Google and GitHub providers. We do not store or sell your sensitive personal data. Comments, likes, and emulator statistics are maintained under Firestore cloud databases.
+                      </p>
+                    </div>
+
+                    <div className="border-t-2 border-black pt-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-neutral-50 p-4 neo-border-sm">
+                      <div>
+                        <p className="font-mono text-xs font-black uppercase text-black">Manage Cookie Settings</p>
+                        <p className="text-[11px] text-neutral-500">Cookie state is updated in your browser in real-time.</p>
+                      </div>
+                      <div className="flex gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCookie("cookie_consent", "accepted", 365);
+                            setShowCookieBanner(false);
+                            alert(language === "en" ? "Cookies allowed successfully!" : "Vidakuzi vimeruhusiwa kikamilifu!");
+                          }}
+                          className="bg-[#10B981] text-white font-black text-xs px-3 py-1.5 neo-border-sm uppercase cursor-pointer transition-colors hover:bg-emerald-600"
+                        >
+                          Accept Cookies
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCookie("cookie_consent", "declined", 365);
+                            setShowCookieBanner(false);
+                            alert(language === "en" ? "Essential cookies only." : "Vidakuzi vya lazima tu.");
+                          }}
+                          className="bg-neutral-200 hover:bg-neutral-300 text-black font-extrabold text-xs px-3 py-1.5 neo-border-sm uppercase cursor-pointer transition-colors"
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* REAL-TIME COOKIE CONSENT BANNER */}
+          <AnimatePresence>
+            {showCookieBanner && (
+              <motion.div
+                id="cookie-consent-banner"
+                initial={{ y: 100, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+                exit={{ y: 100, opacity: 0 }}
+                transition={{ type: "spring", damping: 20 }}
+                className="fixed bottom-4 left-4 right-4 md:left-auto md:right-4 md:max-w-md bg-white text-black neo-border p-5 z-40 neo-shadow-lg flex flex-col gap-4 text-left"
+              >
+                <div className="flex items-start gap-3">
+                  <div className="bg-[#FACC15] p-2 neo-border-sm shrink-0">
+                    <Sparkles className="w-5 h-5 text-black animate-pulse" />
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="font-mono text-xs font-black uppercase tracking-wider text-neutral-800">
+                      Cookies & Privacy
+                    </h4>
+                    <p className="text-xs font-semibold leading-relaxed text-neutral-600">
+                      We use real-time cookies to remember your language preferences, keep your session secure, and protect the community from abusive terms.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCookie("cookie_consent", "accepted", 365);
+                      setShowCookieBanner(false);
+                    }}
+                    className="flex-1 bg-[#10B981] hover:bg-emerald-400 text-white font-black py-2 px-3 neo-border-sm uppercase tracking-wide cursor-pointer transition-colors"
+                  >
+                    Accept All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCookie("cookie_consent", "declined", 365);
+                      setShowCookieBanner(false);
+                    }}
+                    className="bg-neutral-100 hover:bg-neutral-200 text-black font-extrabold py-2 px-3 neo-border-sm uppercase tracking-wide cursor-pointer transition-colors"
+                  >
+                    Reject
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowPrivacyModal(true)}
+                    className="bg-black hover:bg-neutral-800 text-white font-black py-2 px-3 neo-border-sm uppercase tracking-wide cursor-pointer transition-colors flex items-center gap-1"
+                  >
+                    Read Policy
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           {/* FOOTER */}
           <footer className="mt-16 pt-12 border-t-4 border-black text-center space-y-6">
             <div className="flex flex-wrap items-center justify-center gap-6">
@@ -2295,6 +2533,13 @@ export default function App() {
                 className="font-black text-xs hover:underline uppercase tracking-widest"
               >
                 SUPPORT / WASILIANA NASI
+              </button>
+              <span className="text-black/30 font-black">•</span>
+              <button
+                onClick={() => setShowPrivacyModal(true)}
+                className="font-black text-xs hover:underline uppercase tracking-widest"
+              >
+                PRIVACY POLICY & COOKIES
               </button>
               <span className="text-black/30 font-black">•</span>
               <a
