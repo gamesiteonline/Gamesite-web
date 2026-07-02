@@ -1,0 +1,100 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+    
+    // 2. Helper Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    // 3. Entity-Specific Schema Validators
+    function isValidLike(data) {
+      return data.userId is string 
+          && data.userId == request.auth.uid
+          && data.gameId is string
+          && data.gameId.size() <= 128;
+    }
+    
+    function isValidStats(data) {
+      return data.gameId is string
+          && data.gameId.size() <= 128
+          && data.likesCount is int
+          && data.likesCount >= 0;
+    }
+
+    function isValidComment(data) {
+      return data.gameId is string
+          && data.gameId.size() <= 128
+          && data.userId is string
+          && data.userId == request.auth.uid
+          && data.userName is string
+          && data.content is string
+          && data.content.size() <= 1000
+          && data.parentId is string
+          && data.parentId.size() <= 128;
+    }
+    
+    // 4. Collection Rules
+    
+    // Users can only view or delete their own likes.
+    // Likes are identified by document ID format '{userId}_{gameId}'
+    match /likes/{likeId} {
+      allow get: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid);
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() 
+                    && isValidId(likeId)
+                    && likeId == (request.auth.uid + "_" + incoming().gameId)
+                    && isValidLike(incoming());
+      allow delete: if isSignedIn() 
+                    && resource.data.userId == request.auth.uid;
+    }
+    
+    // Anyone can view global game stats.
+    // Alterations to likesCount are atomic and coupled with a like creation/deletion in the same write batch.
+    match /games/{gameId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+                    && isValidId(gameId)
+                    && isValidStats(incoming())
+                    && incoming().likesCount == 1
+                    && existsAfter(/databases/$(database)/documents/likes/$(request.auth.uid + "_" + gameId));
+                    
+      allow update: if isSignedIn()
+                    && isValidId(gameId)
+                    && isValidStats(incoming())
+                    && (
+                      // Action: Like (likesCount increments by 1, and the like document is written in this batch)
+                      (incoming().likesCount == existing().likesCount + 1 && existsAfter(/databases/$(database)/documents/likes/$(request.auth.uid + "_" + gameId)))
+                      ||
+                      // Action: Unlike (likesCount decrements by 1, and the like document is deleted in this batch)
+                      (incoming().likesCount == existing().likesCount - 1 && !existsAfter(/databases/$(database)/documents/likes/$(request.auth.uid + "_" + gameId)))
+                    );
+    }
+
+    // Anyone can read comments. Authenticated users can write comments if they meet the comment validation.
+    match /comments/{commentId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+                    && isValidId(commentId)
+                    && isValidComment(incoming());
+      allow delete, update: if false; // comments are immutable
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "GameLike": {
+      "title": "GameLike",
+      "description": "A record of a user liking a specific game to prevent duplicate likes and track user favorites",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who liked the game"
+        },
+        "gameId": {
+          "type": "string",
+          "description": "The unique ID of the liked game"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the game was liked"
+        }
+      },
+      "required": ["userId", "gameId", "createdAt"]
+    },
+    "GameStats": {
+      "title": "GameStats",
+      "description": "Statistics for a game, specifically tracking the real-time global likes count",
+      "type": "object",
+      "properties": {
+        "gameId": {
+          "type": "string",
+          "description": "The unique ID of the game"
+        },
+        "likesCount": {
+          "type": "integer",
+          "description": "Total number of users who liked this game"
+        }
+      },
+      "required": ["gameId", "likesCount"]
+    },
+    "GameComment": {
+      "title": "GameComment",
+      "description": "A real-time user comment on a game",
+      "type": "object",
+      "properties": {
+        "gameId": {
+          "type": "string",
+          "description": "ID of the commented game"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID of the commenter"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Display name of the commenter"
+        },
+        "userAvatar": {
+          "type": "string",
+          "description": "Avatar URL of the commenter"
+        },
+        "content": {
+          "type": "string",
+          "description": "The cleaned/filtered text content of the comment"
+        },
+        "parentId": {
+          "type": "string",
+          "description": "The document ID of the parent comment, or empty string if it is a top-level comment"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation"
+        }
+      },
+      "required": ["gameId", "userId", "userName", "userAvatar", "content", "createdAt", "parentId"]
+    }
+  },
+  "firestore": {
+    "/likes/{likeId}": {
+      "schema": "GameLike",
+      "description": "Tracks which users liked which games using document ID pattern '{userId}_{gameId}'"
+    },
+    "/games/{gameId}": {
+      "schema": "GameStats",
+      "description": "Stores aggregate statistics like real-time global likesCount for each game"
+    },
+    "/comments/{commentId}": {
+      "schema": "GameComment",
+      "description": "Stores real-time user comments on games"
+    }
+  }
+}

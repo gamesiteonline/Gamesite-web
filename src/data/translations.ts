@@ -86,7 +86,7 @@ export const TRANSLATIONS: Record<"en" | "sw", LanguageDictionary> = {
     telegramBot: "Telegram Admin: @faliz_AI",
     homeTitle: "THE RETRO HUB",
     homeSub: "Fast, unfiltered, high-speed direct game downloads for mobile and console emulators.",
-    downloadProtocolTitle: "AN1 Game Download Protocol"
+    downloadProtocolTitle: "Game Download Protocol"
   },
   sw: {
     welcomeTitle: "KARIBU GAMESITEONLINE",
@@ -130,6 +130,6 @@ export const TRANSLATIONS: Record<"en" | "sw", LanguageDictionary> = {
     telegramBot: "Telegram Admin: @faliz_AI",
     homeTitle: "KITUO CHA RETRO",
     homeSub: "Upakuaji wa michezo wa haraka, wa moja kwa moja, usio na kikomo kwa emulators za simu na kompyuta.",
-    downloadProtocolTitle: "Itifaki ya Kupakua Mchezo ya AN1"
+    downloadProtocolTitle: "Itifaki ya Kupakua Mchezo"
   }
 };

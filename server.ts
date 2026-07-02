@@ -1,9 +1,9 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GAMES_DATABASE, Game } from "./src/data/games";
+import { Game } from "./src/data/games";
 
-let cachedGames: Game[] = [...GAMES_DATABASE];
+let cachedGames: Game[] = [];
 let isFetchingDb = false;
 let dbFetchError: string | null = null;
 
@@ -214,18 +214,10 @@ async function fetchFullDatabase() {
       });
     }
 
-    // Merge with our existing curated fallback games, removing duplicates by both GameID and Normalized Title + Platform
+    // Deduplicate fetched games by both GameID and Normalized Title + Platform
     const seenIds = new Set<string>();
     const seenTitlesAndPlatforms = new Set<string>();
     const merged: Game[] = [];
-
-    // Prioritize high-quality curated local ones
-    for (const g of GAMES_DATABASE) {
-      const titlePlatformKey = `${normalizeName(g.FileName)}_${g.Platform.toLowerCase()}`;
-      merged.push(g);
-      seenIds.add(g.GameID);
-      seenTitlesAndPlatforms.add(titlePlatformKey);
-    }
 
     for (const g of mappedGames) {
       const titlePlatformKey = `${normalizeName(g.FileName)}_${g.Platform.toLowerCase()}`;
@@ -699,6 +691,83 @@ Do not include any markdown formatting, code blocks, or other text.
       });
     } catch (error: any) {
       console.error("Translation error:", error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route for Faliz AI Chat Companion specifically responding to active game context
+  app.post("/api/faliz-ai/chat", async (req, res) => {
+    try {
+      const { messages, gameContext, language } = req.body;
+      if (!gameContext) {
+        return res.status(400).json({ success: false, error: "Missing game context" });
+      }
+
+      const aiKey = process.env.GEMINI_API_KEY;
+      if (!aiKey) {
+        // High-fidelity fallback chat message if API key is not yet set up
+        const isSw = language === "sw";
+        const fallbackText = isSw
+          ? `Habari! Mimi ni **Faliz AI**, msaidizi wako wa kibinafsi wa michezo kwa ajili ya **${gameContext.FileName}**! 🎮\n\nSasa hivi bado sijaunganishwa na ufunguo wa Gemini API (GEMINI_API_KEY). Ili niweze kukupa vidokezo sahihi vya mchezo, setups za emulator, na cheats kwa njia ya akili mnemba (AI), tafadhali ongeza \`GEMINI_API_KEY\` katika **Settings > Secrets** panel!`
+          : `Hello! I am **Faliz AI**, your personal gaming companion for **${gameContext.FileName}**! 🎮\n\nRight now, I am running in offline preview mode because the \`GEMINI_API_KEY\` is not set in the environment. To fully activate my real-time gaming guide, cheat lookup, and emulator support powered by Gemini, please configure the \`GEMINI_API_KEY\` in your app's **Settings > Secrets** panel!`;
+
+        return res.json({
+          success: true,
+          response: fallbackText
+        });
+      }
+
+      const { GoogleGenAI } = await import("@google/genai");
+      const ai = new GoogleGenAI({
+        apiKey: aiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+
+      // Construct system instruction that enforces specific game behavior only
+      const targetLang = language === "sw" ? "Kiswahili (with technical terms like console, emulator, ROMs in English)" : "English";
+      const systemInstruction = `You are "Faliz AI", an expert retro gaming assistant on gamesiteonline.com.
+You must strictly respond ONLY about the active game described in this context:
+---
+Game ID: ${gameContext.GameID || "Unknown"}
+Name: ${gameContext.FileName || "Unknown"}
+Platform: ${gameContext.Platform || "Unknown"}
+Genre: ${gameContext.Genre || "Unknown"}
+Size: ${gameContext.Size || "Unknown"}
+Description: ${gameContext.DescriptionEn || ""}
+Compatibility Notes: ${gameContext.CompatibilityEn || ""}
+---
+Rules:
+1. Your tone must be extremely direct, concise, and to the point. No conversational fluff, no chatty preambles, and no friendly greetings or polite outros. Give a directed, focused answer immediately.
+2. Address questions specifically and only about this game (how to play, secrets, tips, emulator setups, history, or lore).
+3. Critical rule: "all the feature should respond to the specific game only and not otherwise". If the user asks general questions, questions about other games, coding, math, general knowledge, or any topic outside this specific game, you MUST flatly and directly refuse to answer. Always respond with: "I am programmed to only assist you with questions directly about the active game: ${gameContext.FileName}." Never provide answers to any out-of-game questions under any circumstances.
+4. Use clear, compact markdown with bullet points where necessary.
+5. Answer directly in ${targetLang}.`;
+
+      // Map chat history safely to the SDK-specified format
+      const contentsPayload = messages.map((msg: any) => ({
+        role: msg.role === "model" ? "model" : "user",
+        parts: [{ text: msg.content }]
+      }));
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: contentsPayload,
+        config: {
+          systemInstruction: systemInstruction,
+          temperature: 0.7,
+        }
+      });
+
+      res.json({
+        success: true,
+        response: response.text || ""
+      });
+    } catch (error: any) {
+      console.error("Faliz AI Chat Error:", error);
       res.status(500).json({ success: false, error: error.message });
     }
   });

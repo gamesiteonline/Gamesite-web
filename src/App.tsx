@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, FormEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Search,
@@ -20,10 +20,47 @@ import {
   Smartphone,
   Gamepad2,
   FileCode,
-  Star
+  Star,
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp
 } from "lucide-react";
-import { GAMES_DATABASE, Game } from "./data/games";
+import { Game } from "./data/games";
 import { TRANSLATIONS } from "./data/translations";
+
+// Firebase SDK and Modular Utility imports
+import {
+  signInWithPopup,
+  GoogleAuthProvider,
+  GithubAuthProvider,
+  signOut,
+  onAuthStateChanged
+} from "firebase/auth";
+import {
+  collection,
+  onSnapshot,
+  query,
+  where,
+  doc,
+  runTransaction,
+  serverTimestamp,
+  setDoc
+} from "firebase/firestore";
+import { auth, db, handleFirestoreError, OperationType, testConnection } from "./lib/firebase";
+
+const ABUSIVE_WORDS = [
+  "fuck", "shit", "ass", "bitch", "bastard", "dick", "cunt", "asshole", 
+  "pussy", "faggot", "nigger", "slut", "whore"
+];
+
+const sanitizeCommentText = (text: string): string => {
+  let sanitized = text;
+  ABUSIVE_WORDS.forEach(word => {
+    const regex = new RegExp(`\\b${word}\\b`, 'gi');
+    sanitized = sanitized.replace(regex, "****");
+  });
+  return sanitized;
+};
 
 export default function App() {
   // 1. Language Preference State
@@ -32,8 +69,8 @@ export default function App() {
     return (stored === "en" || stored === "sw") ? stored : null;
   });
 
-  // 2. Database State (Fetched from API with static local fallback)
-  const [games, setGames] = useState<Game[]>(GAMES_DATABASE);
+  // 2. Database State (Fetched from API)
+  const [games, setGames] = useState<Game[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [apiError, setApiError] = useState<boolean>(false);
 
@@ -51,6 +88,12 @@ export default function App() {
   const [visibleCount, setVisibleCount] = useState<number>(32);
   const [isTranslating, setIsTranslating] = useState<boolean>(false);
 
+  // Download progress states
+  const [downloadingGameId, setDownloadingGameId] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [downloadStatus, setDownloadStatus] = useState<string>("connecting"); // "connecting", "downloading", "finalizing", "complete"
+  const [downloadSpeed, setDownloadSpeed] = useState<string>("0 MB/s");
+
   // Authentication & Favorites States
   const [user, setUser] = useState<{
     uid: string;
@@ -65,12 +108,121 @@ export default function App() {
   });
 
   const [likes, setLikes] = useState<string[]>([]);
+  const [globalLikes, setGlobalLikes] = useState<Record<string, number>>({});
   const [showOnlyFavorites, setShowOnlyFavorites] = useState<boolean>(false);
   const [showAuthToast, setShowAuthToast] = useState<boolean>(false);
   const [configStatus, setConfigStatus] = useState<{googleConfigured: boolean; githubConfigured: boolean}>({
     googleConfigured: false,
     githubConfigured: false
   });
+
+  // Comments, Abusive filter and Banning States
+  const [isBanned, setIsBanned] = useState<boolean>(() => {
+    const bannedUntilStr = localStorage.getItem("banned_until");
+    if (bannedUntilStr) {
+      const bannedUntil = parseInt(bannedUntilStr, 10);
+      return bannedUntil > Date.now();
+    }
+    return false;
+  });
+  const [banTimeLeft, setBanTimeLeft] = useState<number>(0);
+  const [comments, setComments] = useState<{
+    id: string;
+    gameId: string;
+    userId: string;
+    userName: string;
+    userAvatar: string;
+    content: string;
+    parentId: string;
+    createdAt: any;
+  }[]>([]);
+  const [commentText, setCommentText] = useState<string>("");
+  const [replyingToId, setReplyingToId] = useState<string | null>(null);
+  const [replyText, setReplyText] = useState<string>("");
+  const [isPostingComment, setIsPostingComment] = useState<boolean>(false);
+
+  // Faliz AI Chatbot States
+  const [falizMessages, setFalizMessages] = useState<{ role: "user" | "model"; content: string }[]>([]);
+  const [falizInput, setFalizInput] = useState<string>("");
+  const [isFalizTyping, setIsFalizTyping] = useState<boolean>(false);
+  const [isFalizMinimized, setIsFalizMinimized] = useState<boolean>(false);
+
+  const [abuseViolations, setAbuseViolations] = useState<number>(() => {
+    const stored = localStorage.getItem("abuse_violations_count");
+    return stored ? parseInt(stored, 10) : 0;
+  });
+
+  // Validate Firestore Connection on Boot
+  useEffect(() => {
+    testConnection();
+  }, []);
+
+  // Sync real-time global likes for all games from Firestore /games collection
+  useEffect(() => {
+    const gamesCol = collection(db, "games");
+    const unsubscribe = onSnapshot(gamesCol, (snapshot) => {
+      const stats: Record<string, number> = {};
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        if (data && typeof data.likesCount === "number") {
+          stats[doc.id] = data.likesCount;
+        }
+      });
+      setGlobalLikes(stats);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, "games");
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Listen to Firebase Authentication State Changes
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        const loggedUser = {
+          uid: firebaseUser.uid,
+          name: firebaseUser.displayName || "Gamer",
+          email: firebaseUser.email || "",
+          avatarUrl: firebaseUser.photoURL || "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png",
+          provider: (firebaseUser.providerData[0]?.providerId === "github.com" ? "github" : "google") as "google" | "github"
+        };
+        setUser(loggedUser);
+        localStorage.setItem("game_user", JSON.stringify(loggedUser));
+      } else {
+        // Only clear if not currently in a demo session (to preserve demo fallback experience)
+        const stored = localStorage.getItem("game_user");
+        const parsed = stored ? JSON.parse(stored) : null;
+        if (!parsed || !parsed.isDemo) {
+          setUser(null);
+          localStorage.removeItem("game_user");
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Sync personal likes (favorites) in real-time from Firestore /likes collection for logged-in user
+  useEffect(() => {
+    if (!user) {
+      setLikes([]);
+      return;
+    }
+    const likesCol = collection(db, "likes");
+    const q = query(likesCol, where("userId", "==", user.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const userLikedIds: string[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        if (data && data.gameId) {
+          userLikedIds.push(data.gameId);
+        }
+      });
+      setLikes(userLikedIds);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, "likes");
+    });
+    return () => unsubscribe();
+  }, [user]);
 
   // Fetch OAuth Configuration on Mount
   useEffect(() => {
@@ -87,85 +239,384 @@ export default function App() {
       .catch((err) => console.warn("Could not fetch OAuth config status from backend", err));
   }, []);
 
-  // Sync likes state with user specific store
+  // Ban timer checking effect
   useEffect(() => {
-    const key = user ? `game_likes_${user.uid}` : "game_likes";
-    const stored = localStorage.getItem(key);
-    setLikes(stored ? JSON.parse(stored) : []);
-  }, [user]);
-
-  // Handle postMessage callback from the popup window
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      const origin = event.origin;
-      if (!origin.endsWith(".run.app") && !origin.includes("localhost")) {
-        return;
-      }
-      if (event.data?.type === "OAUTH_AUTH_SUCCESS") {
-        const userData = event.data.user;
-        setUser(userData);
-        localStorage.setItem("game_user", JSON.stringify(userData));
-        setShowAuthToast(true);
-        setTimeout(() => setShowAuthToast(false), 5000);
-      }
-    };
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, []);
-
-  const handleLogin = async (provider: "google" | "github") => {
-    try {
-      const redirectUri = window.location.origin + "/auth/callback";
-      const response = await fetch(`/api/auth/url?provider=${provider}&redirectUri=${encodeURIComponent(redirectUri)}`);
-      if (!response.ok) {
-        throw new Error("Failed to get auth URL");
-      }
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || "Failed to initiate login");
-      }
-
-      if (data.url) {
-        const authWindow = window.open(data.url, "oauth_popup", "width=600,height=700");
-        if (!authWindow) {
-          alert("Please allow popups for this site to sign in.");
+    const checkAndTick = () => {
+      const bannedUntilStr = localStorage.getItem("banned_until");
+      if (bannedUntilStr) {
+        const bannedUntil = parseInt(bannedUntilStr, 10);
+        const now = Date.now();
+        if (bannedUntil > now) {
+          setIsBanned(true);
+          setBanTimeLeft(Math.ceil((bannedUntil - now) / 1000));
+        } else {
+          localStorage.removeItem("banned_until");
+          localStorage.removeItem("abuse_violations_count");
+          setIsBanned(false);
+          setBanTimeLeft(0);
+          setAbuseViolations(0);
         }
       } else {
-        // Fallback Demo Login
-        const demoUser = {
-          uid: `demo:${provider}:${Math.floor(Math.random() * 100000)}`,
-          name: provider === "google" ? "Demo Google Player" : "Demo GitHub Player",
-          email: `${provider}-demo@gamesiteonline.com`,
-          avatarUrl: provider === "google"
-            ? "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png"
-            : "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png",
-          provider,
-          isDemo: true
-        };
-        setUser(demoUser);
-        localStorage.setItem("game_user", JSON.stringify(demoUser));
+        setIsBanned(false);
+        setBanTimeLeft(0);
+      }
+    };
+
+    checkAndTick();
+    const interval = setInterval(checkAndTick, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Real-time comments loader for active selected game only
+  useEffect(() => {
+    if (!selectedGameId) {
+      setComments([]);
+      return;
+    }
+
+    const commentsCol = collection(db, "comments");
+    const q = query(
+      commentsCol, 
+      where("gameId", "==", selectedGameId)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const loadedComments: any[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        loadedComments.push({
+          id: doc.id,
+          ...data
+        });
+      });
+      // Sort in memory by createdAt descending to ensure reliability and bypass indexing issues
+      loadedComments.sort((a, b) => {
+        const t1 = a.createdAt?.seconds || (Date.now() / 1000);
+        const t2 = b.createdAt?.seconds || (Date.now() / 1000);
+        return t2 - t1; // Newest first
+      });
+      setComments(loadedComments);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, `comments/${selectedGameId}`);
+    });
+
+    return () => unsubscribe();
+  }, [selectedGameId]);
+
+  // Firebase login handler using Popup auth flow
+  const handleLogin = async (providerName: "google" | "github") => {
+    try {
+      if (providerName === "google") {
+        const provider = new GoogleAuthProvider();
+        await signInWithPopup(auth, provider);
         setShowAuthToast(true);
         setTimeout(() => setShowAuthToast(false), 5000);
+      } else {
+        try {
+          const provider = new GithubAuthProvider();
+          await signInWithPopup(auth, provider);
+          setShowAuthToast(true);
+          setTimeout(() => setShowAuthToast(false), 5000);
+        } catch (gitErr) {
+          console.warn("GitHub Firebase auth not enabled. Falling back to Github demo login.", gitErr);
+          const demoUser = {
+            uid: `demo:github:${Math.floor(Math.random() * 100000)}`,
+            name: "Demo GitHub Player",
+            email: "github-demo@gamesiteonline.com",
+            avatarUrl: "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png",
+            provider: "github" as const,
+            isDemo: true
+          };
+          setUser(demoUser);
+          localStorage.setItem("game_user", JSON.stringify(demoUser));
+          setShowAuthToast(true);
+          setTimeout(() => setShowAuthToast(false), 5000);
+        }
       }
     } catch (err) {
       console.error("Login Error:", err);
     }
   };
 
-  const handleLogout = () => {
-    setUser(null);
-    localStorage.removeItem("game_user");
-    setShowOnlyFavorites(false);
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setUser(null);
+      localStorage.removeItem("game_user");
+      setShowOnlyFavorites(false);
+    } catch (err) {
+      console.error("Signout Error:", err);
+      setUser(null);
+      localStorage.removeItem("game_user");
+      setShowOnlyFavorites(false);
+    }
   };
 
-  const toggleLike = (gameId: string) => {
-    setLikes((prev) => {
-      const isLiked = prev.includes(gameId);
-      const updated = isLiked ? prev.filter((id) => id !== gameId) : [...prev, gameId];
-      const key = user ? `game_likes_${user.uid}` : "game_likes";
-      localStorage.setItem(key, JSON.stringify(updated));
-      return updated;
+  const handlePostComment = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!user) {
+      alert(language === "en" ? "Please sign in to comment!" : "Tafadhali ingia ili kuandika maoni!");
+      return;
+    }
+    if (isBanned) return;
+
+    const trimmedText = commentText.trim();
+    if (!trimmedText) return;
+
+    // Check for abusive words
+    const lowerText = trimmedText.toLowerCase();
+    const hasAbuse = ABUSIVE_WORDS.some(word => {
+      const regex = new RegExp(`\\b${word}\\b`, 'i');
+      return regex.test(lowerText);
     });
+
+    if (hasAbuse) {
+      const newViolations = abuseViolations + 1;
+      setAbuseViolations(newViolations);
+      localStorage.setItem("abuse_violations_count", newViolations.toString());
+
+      if (newViolations >= 3) {
+        // Ban for 1 hour
+        const bannedUntil = Date.now() + 3600 * 1000;
+        localStorage.setItem("banned_until", bannedUntil.toString());
+        setIsBanned(true);
+        setBanTimeLeft(3600);
+        setCommentText("");
+        alert(
+          language === "en"
+            ? "ACCESS BLOCKED: You have been temporarily banned for 1 hour for using abusive language (3/3 violations)."
+            : "KAZI IMEZUIWA: Umefungiwa kwa muda wa saa 1 kwa kutumia lugha ya matusi (makosa 3/3)."
+        );
+      } else {
+        alert(
+          language === "en"
+            ? `WARNING: Abusive language detected! Comment blocked. Violation count: ${newViolations}/3. At 3 violations, you will be banned for 1 hour.`
+            : `ONYO: Lugha ya matusi imetambuliwa! Maoni yamezuiwa. Idadi ya makosa: ${newViolations}/3. Ukifikisha makosa 3, utafungiwa kwa saa 1.`
+        );
+      }
+      return;
+    }
+
+    setIsPostingComment(true);
+    // Generate a unique ID for the comment doc to meet security specs and avoid collisions
+    const commentId = `comment_${user.uid}_${Math.floor(Math.random() * 100000000)}`;
+    const commentRef = doc(db, "comments", commentId);
+
+    try {
+      await setDoc(commentRef, {
+        gameId: selectedGameId || "global",
+        userId: user.uid,
+        userName: user.name,
+        userAvatar: user.avatarUrl,
+        content: trimmedText,
+        parentId: "",
+        createdAt: serverTimestamp()
+      });
+      setCommentText("");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `comments/${commentId}`);
+    } finally {
+      setIsPostingComment(false);
+    }
+  };
+
+  const handlePostReply = async (e: FormEvent, parentId: string) => {
+    e.preventDefault();
+    if (!user) {
+      alert(language === "en" ? "Please sign in to reply!" : "Tafadhali ingia ili ujibu!");
+      return;
+    }
+    if (isBanned) return;
+
+    const trimmedText = replyText.trim();
+    if (!trimmedText) return;
+
+    // Check for abusive words
+    const lowerText = trimmedText.toLowerCase();
+    const hasAbuse = ABUSIVE_WORDS.some(word => {
+      const regex = new RegExp(`\\b${word}\\b`, 'i');
+      return regex.test(lowerText);
+    });
+
+    if (hasAbuse) {
+      const newViolations = abuseViolations + 1;
+      setAbuseViolations(newViolations);
+      localStorage.setItem("abuse_violations_count", newViolations.toString());
+
+      if (newViolations >= 3) {
+        // Ban for 1 hour
+        const bannedUntil = Date.now() + 3600 * 1000;
+        localStorage.setItem("banned_until", bannedUntil.toString());
+        setIsBanned(true);
+        setBanTimeLeft(3600);
+        setReplyText("");
+        setReplyingToId(null);
+        alert(
+          language === "en"
+            ? "ACCESS BLOCKED: You have been temporarily banned for 1 hour for using abusive language (3/3 violations)."
+            : "KAZI IMEZUIWA: Umefungiwa kwa muda wa saa 1 kwa kutumia lugha ya matusi (makosa 3/3)."
+        );
+      } else {
+        alert(
+          language === "en"
+            ? `WARNING: Abusive language detected! Comment blocked. Violation count: ${newViolations}/3. At 3 violations, you will be banned for 1 hour.`
+            : `ONYO: Lugha ya matusi imetambuliwa! Maoni yamezuiwa. Idadi ya makosa: ${newViolations}/3. Ukifikisha makosa 3, utafungiwa kwa saa 1.`
+        );
+      }
+      return;
+    }
+
+    setIsPostingComment(true);
+    const commentId = `comment_${user.uid}_${Math.floor(Math.random() * 100000000)}`;
+    const commentRef = doc(db, "comments", commentId);
+
+    try {
+      await setDoc(commentRef, {
+        gameId: selectedGameId || "global",
+        userId: user.uid,
+        userName: user.name,
+        userAvatar: user.avatarUrl,
+        content: trimmedText,
+        parentId: parentId,
+        createdAt: serverTimestamp()
+      });
+      setReplyText("");
+      setReplyingToId(null);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `comments/${commentId}`);
+    } finally {
+      setIsPostingComment(false);
+    }
+  };
+
+  // Atomic Real-Time Toggle Like syncing directly with Firestore
+  const toggleLike = async (gameId: string) => {
+    if (!user) {
+      alert(language === "en" ? "Please sign in to favorite games!" : "Tafadhali ingia ili uweke mchezo kwenye favorites!");
+      return;
+    }
+
+    const likeDocId = `${user.uid}_${gameId}`;
+    const likeRef = doc(db, "likes", likeDocId);
+    const statsRef = doc(db, "games", gameId);
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const likeDoc = await transaction.get(likeRef);
+        const statsDoc = await transaction.get(statsRef);
+
+        const currentlyLiked = likeDoc.exists();
+
+        if (currentlyLiked) {
+          // Unlike Action: delete the like, decrement the counter
+          transaction.delete(likeRef);
+          if (statsDoc.exists()) {
+            const currentLikes = statsDoc.data().likesCount || 0;
+            transaction.update(statsRef, {
+              likesCount: Math.max(0, currentLikes - 1)
+            });
+          }
+        } else {
+          // Like Action: create the like, increment the counter
+          transaction.set(likeRef, {
+            userId: user.uid,
+            gameId: gameId,
+            createdAt: serverTimestamp()
+          });
+
+          if (statsDoc.exists()) {
+            transaction.update(statsRef, {
+              likesCount: (statsDoc.data().likesCount || 0) + 1
+            });
+          } else {
+            transaction.set(statsRef, {
+              gameId: gameId,
+              likesCount: 1
+            });
+          }
+        }
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `likes/${likeDocId}`);
+    }
+  };
+
+  const initiateDirectDownload = (url: string, filename: string) => {
+    try {
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", filename);
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err) {
+      console.error("Direct download trigger failed, using location routing", err);
+      window.location.href = url;
+    }
+  };
+
+  const formatTimeLeft = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  };
+
+  const startDownload = (game: Game) => {
+    if (downloadingGameId) return;
+
+    setDownloadingGameId(game.GameID);
+    setDownloadProgress(0);
+    setDownloadStatus("connecting");
+    setDownloadSpeed("0 MB/s");
+
+    let progress = 0;
+    const intervalMs = 120; // tick every 120ms
+    const interval = setInterval(() => {
+      // Custom progress speed curves to make it look genuine
+      let step = 1.5;
+      if (progress < 20) {
+        step = Math.random() * 4 + 2; // quick initial connection
+      } else if (progress < 80) {
+        step = Math.random() * 6 + 3; // stable streaming
+      } else {
+        step = Math.random() * 2 + 1; // finalizing step
+      }
+
+      progress += step;
+
+      if (progress >= 100) {
+        progress = 100;
+        setDownloadProgress(100);
+        setDownloadStatus("complete");
+        setDownloadSpeed("Done!");
+        clearInterval(interval);
+
+        // Download the file directly in the current frame without navigating away
+        initiateDirectDownload(game.DownloadLink, game.FileName);
+
+        // Reset progress bar after some seconds to let them see completion
+        setTimeout(() => {
+          setDownloadingGameId(null);
+        }, 2500);
+      } else {
+        setDownloadProgress(Math.floor(progress));
+        
+        // Dynamic labels & realistic rates
+        const currentP = Math.floor(progress);
+        if (currentP < 15) {
+          setDownloadStatus("connecting");
+          setDownloadSpeed("Connecting...");
+        } else if (currentP < 85) {
+          setDownloadStatus("downloading");
+          const kbps = (Math.random() * 8 + 14).toFixed(1);
+          setDownloadSpeed(`${kbps} MB/s`);
+        } else {
+          setDownloadStatus("finalizing");
+          setDownloadSpeed("Allocating...");
+        }
+      }
+    }, intervalMs);
   };
 
   // Fetch games from Express API
@@ -338,6 +789,112 @@ export default function App() {
     }
   }, [language, selectedGameId, activeGame]);
 
+  // Initialize Faliz AI Chat thread with a game-specific greeting when a game is selected
+  useEffect(() => {
+    if (selectedGameId && activeGame) {
+      const isSw = language === "sw";
+      const greeting = isSw
+        ? `Mambo! Mimi ni **Faliz AI**, msaidizi wako wa kibinafsi wa michezo kwa ajili ya **${activeGame.FileName}**! 🎮🔥\n\nUnaweza kuniuliza kuhusu vidokezo vya mchezo (tips & tricks), jinsi ya kuweka emulator (emulator setup), cheats, au siri za mchezo huu wa kipekee! Unataka kujua nini leo kuhusu mchezo huu?`
+        : `Hey there! I am **Faliz AI**, your personal AI gaming companion for **${activeGame.FileName}**! 🎮🔥\n\nAsk me anything about gameplay tips, secrets, cheats, or emulator setup specifically for this game. What would you like to know about it today?`;
+      
+      setFalizMessages([{ role: "model", content: greeting }]);
+      setFalizInput("");
+    } else {
+      setFalizMessages([]);
+      setFalizInput("");
+    }
+  }, [selectedGameId, language, activeGame]);
+
+  const handleSendFalizMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!falizInput.trim() || isFalizTyping || !activeGame) return;
+
+    const userMessage = { role: "user" as const, content: falizInput.trim() };
+    const updatedMessages = [...falizMessages, userMessage];
+    setFalizMessages(updatedMessages);
+    setFalizInput("");
+    setIsFalizTyping(true);
+
+    try {
+      const response = await fetch("/api/faliz-ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: updatedMessages,
+          gameContext: activeGame,
+          language: language
+        })
+      });
+
+      const data = await response.json();
+      if (data.success) {
+        setFalizMessages(prev => [...prev, { role: "model" as const, content: data.response }]);
+      } else {
+        const errorMsg = language === "sw"
+          ? "Pole! Imeshindwa kupata jibu kutoka kwa Faliz AI."
+          : "Oops! Failed to fetch a response from Faliz AI.";
+        setFalizMessages(prev => [...prev, { role: "model" as const, content: errorMsg }]);
+      }
+    } catch (err) {
+      console.error("Error communicating with Faliz AI:", err);
+      const errorMsg = language === "sw"
+        ? "Pole! Kosa la mtandao limetokea."
+        : "Oops! A network error occurred.";
+      setFalizMessages(prev => [...prev, { role: "model" as const, content: errorMsg }]);
+    } finally {
+      setIsFalizTyping(false);
+    }
+  };
+
+  const formatFalizMessage = (text: string) => {
+    return text.split("\n").map((line, idx) => {
+      let isBullet = false;
+      let cleanLine = line;
+      if (line.trim().startsWith("* ") || line.trim().startsWith("- ")) {
+        isBullet = true;
+        cleanLine = line.trim().substring(2);
+      }
+
+      const parts: React.ReactNode[] = [];
+      let lastIndex = 0;
+      const regex = /\*\*([\s\S]*?)\*\*/g;
+      let match;
+
+      while ((match = regex.exec(cleanLine)) !== null) {
+        const matchIndex = match.index;
+        if (matchIndex > lastIndex) {
+          parts.push(cleanLine.substring(lastIndex, matchIndex));
+        }
+        parts.push(
+          <strong key={matchIndex} className="font-extrabold text-black">
+            {match[1]}
+          </strong>
+        );
+        lastIndex = regex.lastIndex;
+      }
+
+      if (lastIndex < cleanLine.length) {
+        parts.push(cleanLine.substring(lastIndex));
+      }
+
+      const contentToRender = parts.length > 0 ? parts : cleanLine;
+
+      if (isBullet) {
+        return (
+          <li key={idx} className="ml-5 list-disc font-semibold text-neutral-800 text-xs sm:text-sm my-1">
+            {contentToRender}
+          </li>
+        );
+      }
+
+      return (
+        <p key={idx} className="font-semibold text-neutral-800 text-xs sm:text-sm leading-relaxed mb-2">
+          {contentToRender}
+        </p>
+      );
+    });
+  };
+
   // Slice the filtered games list for progressive/paginated rendering to support 20,000+ items smoothly
   const visibleGames = useMemo(() => {
     return filteredGames.slice(0, visibleCount);
@@ -398,6 +955,264 @@ export default function App() {
     };
     return authTranslations[activeLang];
   }, [language]);
+
+  const renderCommentsSection = () => {
+    // Separate root comments and replies
+    const rootComments = comments.filter(c => !c.parentId);
+    const repliesMap: Record<string, typeof comments> = {};
+    comments.forEach(c => {
+      if (c.parentId) {
+        if (!repliesMap[c.parentId]) {
+          repliesMap[c.parentId] = [];
+        }
+        repliesMap[c.parentId].push(c);
+      }
+    });
+
+    // Sort replies by date ascending so discussions flow naturally (oldest reply first at the bottom of root comment)
+    Object.keys(repliesMap).forEach(key => {
+      repliesMap[key].sort((a, b) => {
+        const t1 = a.createdAt?.seconds || (Date.now() / 1000);
+        const t2 = b.createdAt?.seconds || (Date.now() / 1000);
+        return t1 - t2;
+      });
+    });
+
+    return (
+      <div className="border-t-4 border-black pt-8 mt-12 flex flex-col gap-6 bg-white p-6 sm:p-8 neo-border neo-shadow">
+        <div className="flex items-center justify-between border-b-4 border-black pb-4">
+          <div className="flex items-center gap-2">
+            <MessageSquare className="w-6 h-6 text-black" />
+            <h3 className="font-extrabold text-xl sm:text-2xl uppercase tracking-tight font-mono">
+              {language === "en" ? "💬 GAME DISCUSSIONS" : "💬 MAZUNGUMZO YA MCHEZO"}
+            </h3>
+            <span className="bg-black text-[#FACC15] text-xs font-bold px-2 py-0.5 neo-border-sm font-mono">
+              {comments.length}
+            </span>
+          </div>
+        </div>
+
+        {/* Write Main Comment Box */}
+        {user ? (
+          <form onSubmit={handlePostComment} className="flex flex-col gap-3 bg-[#FFF250]/10 p-4 neo-border">
+            <div className="relative">
+              <textarea
+                value={commentText}
+                onChange={(e) => setCommentText(e.target.value.slice(0, 1000))}
+                placeholder={language === "en" ? "Share your memories, emulator setups, or ask a question..." : "Shiriki kumbukumbu zako, mipangilio ya emulator, au uliza swali..."}
+                className="w-full min-h-[100px] bg-white text-black neo-border p-4 font-semibold text-sm focus:outline-hidden resize-none placeholder-neutral-400"
+                disabled={isPostingComment}
+              />
+              <span className="absolute bottom-2 right-3 text-[10px] font-bold font-mono text-neutral-400">
+                {commentText.length}/1000
+              </span>
+            </div>
+            <button
+              type="submit"
+              disabled={isPostingComment || !commentText.trim()}
+              className="bg-[#84CC16] hover:bg-lime-500 disabled:bg-neutral-200 disabled:text-neutral-400 disabled:cursor-not-allowed text-black font-black py-3 px-6 neo-border neo-shadow neo-shadow-hover text-xs uppercase tracking-wider self-start flex items-center gap-2 transition-all cursor-pointer"
+            >
+              {isPostingComment && !replyingToId ? (
+                <>
+                  <span className="animate-spin inline-block w-3 h-3 border-2 border-black border-t-transparent rounded-full"></span>
+                  {language === "en" ? "POSTING..." : "INATUMA..."}
+                </>
+              ) : (
+                <>
+                  <Send className="w-3.5 h-3.5" />
+                  {language === "en" ? "POST COMMENT" : "TUMA MAONI"}
+                </>
+              )}
+            </button>
+          </form>
+        ) : (
+          <div className="bg-amber-50 neo-border p-4 text-center">
+            <p className="text-sm font-bold text-amber-900 mb-2">
+              {language === "en" 
+                ? "Sign in to join the conversation and leave a comment!" 
+                : "Ingia ili kujiunga na mazungumzo na kuacha maoni!"}
+            </p>
+            <div className="flex justify-center gap-3 mt-3">
+              <button
+                type="button"
+                onClick={() => handleLogin("google")}
+                className="bg-white hover:bg-neutral-100 text-black font-bold py-1.5 px-3 text-xs neo-border-sm neo-shadow-sm neo-shadow-hover cursor-pointer uppercase flex items-center gap-1.5"
+              >
+                Google
+              </button>
+              <button
+                type="button"
+                onClick={() => handleLogin("github")}
+                className="bg-black hover:bg-neutral-800 text-white font-bold py-1.5 px-3 text-xs neo-border-sm neo-shadow-sm neo-shadow-hover cursor-pointer uppercase flex items-center gap-1.5"
+              >
+                GitHub
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Real-Time Comments List */}
+        <div className="flex flex-col gap-6 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+          {rootComments.length > 0 ? (
+            rootComments.map((comment) => {
+              const rootReplies = repliesMap[comment.id] || [];
+              return (
+                <div key={comment.id} className="flex flex-col gap-3">
+                  {/* Root Comment Row */}
+                  <div className="bg-white neo-border p-5 neo-shadow-sm flex gap-4 relative">
+                    <div className="w-12 h-12 rounded-full overflow-hidden neo-border-sm bg-[#A855F7] shrink-0">
+                      <img 
+                        src={comment.userAvatar || "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png"} 
+                        alt={comment.userName} 
+                        className="w-full h-full object-cover"
+                        referrerPolicy="no-referrer"
+                      />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between mb-1 gap-2">
+                        <span className="font-extrabold text-sm sm:text-base truncate text-black uppercase font-mono">
+                          {comment.userName}
+                        </span>
+                        <span className="font-mono text-[10px] font-bold text-neutral-400 shrink-0">
+                          {comment.createdAt ? new Date(comment.createdAt.seconds * 1000).toLocaleDateString(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit'
+                          }) : "Just now"}
+                        </span>
+                      </div>
+                      <p className="text-sm font-semibold text-neutral-800 break-words whitespace-pre-wrap mb-3">
+                        {sanitizeCommentText(comment.content)}
+                      </p>
+
+                      {/* Comment Actions (e.g. Reply) */}
+                      <div className="flex items-center gap-4">
+                        <button
+                          onClick={() => {
+                            if (replyingToId === comment.id) {
+                              setReplyingToId(null);
+                              setReplyText("");
+                            } else {
+                              setReplyingToId(comment.id);
+                              setReplyText("");
+                            }
+                          }}
+                          className="text-xs font-bold font-mono text-neutral-600 hover:text-black uppercase tracking-wider flex items-center gap-1 cursor-pointer transition-colors"
+                        >
+                          💬 {replyingToId === comment.id 
+                            ? (language === "en" ? "Cancel" : "Ghairi") 
+                            : (language === "en" ? "Reply" : "Jibu")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Inline Reply Form */}
+                  {replyingToId === comment.id && (
+                    <form 
+                      onSubmit={(e) => handlePostReply(e, comment.id)} 
+                      className="ml-8 sm:ml-12 bg-white p-4 neo-border flex flex-col gap-2"
+                    >
+                      <div className="text-xs font-mono font-bold text-neutral-500 uppercase">
+                        {language === "en" ? `Replying to ${comment.userName}:` : `Unamjibu ${comment.userName}:`}
+                      </div>
+                      <div className="relative">
+                        <textarea
+                          value={replyText}
+                          onChange={(e) => setReplyText(e.target.value.slice(0, 1000))}
+                          placeholder={language === "en" ? "Write a helpful response..." : "Andika jibu la kusaidia..."}
+                          className="w-full min-h-[80px] bg-white text-black neo-border-sm p-3 font-semibold text-xs focus:outline-hidden resize-none placeholder-neutral-400"
+                          disabled={isPostingComment}
+                        />
+                        <span className="absolute bottom-2 right-3 text-[9px] font-bold font-mono text-neutral-400">
+                          {replyText.length}/1000
+                        </span>
+                      </div>
+                      <div className="flex gap-2 justify-start">
+                        <button
+                          type="submit"
+                          disabled={isPostingComment || !replyText.trim()}
+                          className="bg-[#F97316] hover:bg-orange-400 disabled:bg-neutral-200 disabled:text-neutral-400 disabled:cursor-not-allowed text-white font-black py-2 px-4 neo-border-sm text-[10px] uppercase tracking-wider flex items-center gap-1.5 transition-all cursor-pointer"
+                        >
+                          {isPostingComment ? (
+                            <>
+                              <span className="animate-spin inline-block w-2.5 h-2.5 border-2 border-white border-t-transparent rounded-full"></span>
+                              {language === "en" ? "REPLYING..." : "INATUMA..."}
+                            </>
+                          ) : (
+                            <>
+                              <Send className="w-2.5 h-2.5" />
+                              {language === "en" ? "SEND REPLY" : "TUMA JIBU"}
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReplyingToId(null);
+                            setReplyText("");
+                          }}
+                          className="bg-white hover:bg-neutral-50 text-black font-black py-2 px-4 neo-border-sm text-[10px] uppercase tracking-wider transition-all cursor-pointer"
+                        >
+                          {language === "en" ? "Cancel" : "Ghairi"}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {/* Replies Threading rendering */}
+                  {rootReplies.length > 0 && (
+                    <div className="ml-8 sm:ml-12 border-l-4 border-black pl-4 sm:pl-6 flex flex-col gap-3">
+                      {rootReplies.map((reply) => (
+                        <div 
+                          key={reply.id} 
+                          className="bg-neutral-50 neo-border-sm p-4 neo-shadow-xs flex gap-3 relative"
+                        >
+                          <div className="w-8 h-8 rounded-full overflow-hidden neo-border-sm bg-[#84CC16] shrink-0">
+                            <img 
+                              src={reply.userAvatar || "https://images.igdb.com/igdb/image/upload/t_cover_big/co1v5y.png"} 
+                              alt={reply.userName} 
+                              className="w-full h-full object-cover"
+                              referrerPolicy="no-referrer"
+                            />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between mb-1 gap-2">
+                              <span className="font-extrabold text-xs truncate text-black uppercase font-mono">
+                                {reply.userName}
+                              </span>
+                              <span className="font-mono text-[8px] font-bold text-neutral-400 shrink-0">
+                                {reply.createdAt ? new Date(reply.createdAt.seconds * 1000).toLocaleDateString(undefined, {
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit'
+                                }) : "Just now"}
+                              </span>
+                            </div>
+                            <p className="text-xs font-semibold text-neutral-800 break-words whitespace-pre-wrap">
+                              {sanitizeCommentText(reply.content)}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            <div className="text-center py-10 text-neutral-500 font-bold text-sm bg-neutral-50 neo-border-sm">
+              {language === "en" 
+                ? "No comments yet. Be the first to start the conversation!" 
+                : "Hakuna maoni bado. Kuwa wa kwanza kuanzisha mazungumzo!"}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-[#FACC15] text-black font-sans relative selection:bg-black selection:text-[#FACC15]">
@@ -464,7 +1279,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* CORE WEB VIEW LAYOUT */}
-      {language !== null && (
+      {language !== null && !isBanned && (
         <div className="w-full max-w-7xl mx-auto px-4 py-8">
           
           {/* AUTH SUCCESS TOAST */}
@@ -582,7 +1397,7 @@ export default function App() {
             <div className="w-full max-w-lg flex flex-col items-center justify-center mb-6 relative">
               <a href="/" className="block focus:outline-none">
                 <img
-                  src="https://github.com/gamesiteonline/gamesiteonline/raw/main/image/1782871878388.png"
+                  src="https://github.com/gamesiteonline/gamesiteonline/raw/main/image/1782960461750.png"
                   alt="GAMESITEONLINE Logo"
                   referrerPolicy="no-referrer"
                   className="h-32 object-contain filter drop-shadow-[4px_4px_0px_rgba(0,0,0,1)] hover:scale-105 transition-transform"
@@ -750,7 +1565,7 @@ export default function App() {
                           </h4>
                           {isTranslating && (
                             <span className="bg-[#FACC15] text-black text-[10px] font-black tracking-wider px-2 py-0.5 neo-border-sm animate-pulse">
-                              🤖 GEMINI TRANSLATING / INATAFSIRI...
+                              🤖 FALIZ AI TRANSLATING / INATAFSIRI...
                             </span>
                           )}
                         </div>
@@ -775,7 +1590,7 @@ export default function App() {
                           </h4>
                           {isTranslating && (
                             <span className="bg-[#FACC15] text-black text-[10px] font-black tracking-wider px-2 py-0.5 neo-border-sm animate-pulse">
-                              🤖 GEMINI TRANSLATING / INATAFSIRI...
+                              🤖 FALIZ AI TRANSLATING / INATAFSIRI...
                             </span>
                           )}
                         </div>
@@ -804,25 +1619,72 @@ export default function App() {
 
                         {/* AN1 Direct High-Speed Download Link & Favorite Button */}
                         <div className="flex flex-col sm:flex-row gap-4">
-                          <a
-                            href={activeGame.DownloadLink}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex-1 bg-[#10B981] hover:bg-[#059669] text-white font-black text-xl sm:text-2xl text-center py-5 px-6 neo-border neo-shadow neo-shadow-hover block transition-all uppercase tracking-wide"
-                          >
-                            📥 {t.downloadBtn} ({activeGame.Size})
-                          </a>
+                          {downloadingGameId === activeGame.GameID ? (
+                            <div className="flex-1 bg-white neo-border p-4 neo-shadow flex flex-col gap-3">
+                              {/* Status title & stats */}
+                              <div className="flex justify-between items-center font-mono text-xs font-extrabold uppercase tracking-wider text-neutral-700">
+                                <span className="flex items-center gap-1.5 text-[#10B981]">
+                                  <span className="inline-block w-2.5 h-2.5 rounded-full bg-[#10B981] animate-ping"></span>
+                                  {downloadStatus === "connecting" && (language === "en" ? "Initializing Tunnel..." : "Inatafuta Mawasiliano...")}
+                                  {downloadStatus === "downloading" && (language === "en" ? `Downloading ROM Pack...` : `Inapakua Mchezo...`)}
+                                  {downloadStatus === "finalizing" && (language === "en" ? "Verifying Checksum..." : "Inakamilisha Faili...")}
+                                  {downloadStatus === "complete" && (language === "en" ? "Download Started!" : "Imepakuliwa!")}
+                                </span>
+                                <span>{downloadSpeed}</span>
+                              </div>
+
+                              {/* Progress bar */}
+                              <div className="w-full bg-[#EEF2F6] neo-border-sm h-6 overflow-hidden relative">
+                                <motion.div 
+                                  className="h-full bg-[#10B981] border-r-2 border-black"
+                                  initial={{ width: "0%" }}
+                                  animate={{ width: `${downloadProgress}%` }}
+                                  transition={{ duration: 0.1 }}
+                                />
+                                <span className="absolute inset-0 flex items-center justify-center font-mono font-black text-xs text-black">
+                                  {downloadProgress}%
+                                </span>
+                              </div>
+
+                              {/* Estimation info */}
+                              <div className="flex justify-between items-center font-mono text-[10px] font-bold uppercase text-neutral-500 tracking-wide">
+                                <span className="truncate max-w-[150px]">{activeGame.FileName}</span>
+                                <span>
+                                  {language === "en" ? "Est. Remaining: " : "Muda uliobaki: "}
+                                  {downloadStatus === "complete" ? "0s" : `${Math.max(1, Math.ceil((100 - downloadProgress) / 16))}s`}
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => startDownload(activeGame)}
+                              className="flex-1 bg-[#10B981] hover:bg-[#059669] text-white font-black text-xl sm:text-2xl text-center py-5 px-6 neo-border neo-shadow neo-shadow-hover block transition-all uppercase tracking-wide cursor-pointer"
+                            >
+                              📥 {t.downloadBtn} ({activeGame.Size})
+                            </button>
+                          )}
                           
                           <button
                             onClick={() => toggleLike(activeGame.GameID)}
-                            className={`sm:w-24 flex items-center justify-center py-5 px-6 neo-border neo-shadow neo-shadow-hover transition-all cursor-pointer ${
+                            className={`flex items-center justify-center gap-2 py-5 px-6 neo-border neo-shadow neo-shadow-hover transition-all cursor-pointer shrink-0 min-w-[120px] ${
                               likes.includes(activeGame.GameID)
                                 ? "bg-rose-500 text-white"
                                 : "bg-white text-black hover:bg-rose-100"
                             }`}
                             title={likes.includes(activeGame.GameID) ? "Remove from Favorites" : "Add to Favorites"}
                           >
-                            <Heart className={`w-8 h-8 ${likes.includes(activeGame.GameID) ? "fill-current animate-pulse" : ""}`} />
+                            <motion.span
+                              key={likes.includes(activeGame.GameID) ? "liked" : "unliked"}
+                              initial={{ scale: 1 }}
+                              animate={{ scale: [1, 1.4, 0.9, 1.15, 1] }}
+                              transition={{ duration: 0.35, ease: "easeOut" }}
+                              className="inline-block"
+                            >
+                              <Heart className={`w-6 h-6 ${likes.includes(activeGame.GameID) ? "fill-current animate-pulse text-white" : ""}`} />
+                            </motion.span>
+                            <span className="font-extrabold text-xl font-mono">
+                              {globalLikes[activeGame.GameID] || 0}
+                            </span>
                           </button>
                         </div>
 
@@ -856,6 +1718,127 @@ export default function App() {
                             💬 {t.joinWhatsappBtn}
                           </a>
                         </div>
+
+                        {/* FALIZ AI CHAT COMPANION */}
+                        <div className="bg-white neo-border p-6 sm:p-8 neo-shadow-lg flex flex-col gap-4">
+                          <div 
+                            onClick={() => setIsFalizMinimized(!isFalizMinimized)}
+                            className="flex flex-col sm:flex-row justify-between sm:items-center pb-4 border-b-2 border-black gap-3 cursor-pointer select-none"
+                          >
+                            <div className="flex items-center gap-3">
+                              <div className="w-10 h-10 rounded-full bg-[#FFF250] neo-border-sm flex items-center justify-center text-black">
+                                <Sparkles className="w-6 h-6 animate-pulse" />
+                              </div>
+                              <div>
+                                <h3 className="font-extrabold text-xl uppercase tracking-tight text-black">
+                                  {language === "en" ? "FALIZ AI CHAT COMPANION" : "FALIZ AI MSAIDIZI WA CHAT"}
+                                </h3>
+                                <p className="font-mono text-[10px] font-bold text-neutral-500 uppercase">
+                                  {language === "en" ? `ACTIVE GAME: ${activeGame.FileName}` : `MCHEZO ACTIVE: ${activeGame.FileName}`}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-3 self-start sm:self-auto">
+                              <span className="bg-[#10B981] text-white text-[10px] font-black tracking-wider px-2 py-0.5 neo-border-sm uppercase">
+                                ● ONLINE
+                              </span>
+                              <button 
+                                type="button"
+                                className="bg-black text-white hover:bg-neutral-800 p-1.5 neo-border-sm cursor-pointer transition-colors"
+                                aria-label="Toggle Chat"
+                              >
+                                {isFalizMinimized ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+                              </button>
+                            </div>
+                          </div>
+
+                          {!isFalizMinimized && (
+                            <div className="flex flex-col gap-6 pt-2">
+                              {/* Chat Window */}
+                              <div className="neo-border bg-[#F8FAFC] p-4 h-[350px] overflow-y-auto flex flex-col gap-4 scrollbar-thin">
+                                {falizMessages.map((msg, idx) => {
+                                  const isModel = msg.role === "model";
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className={`flex gap-3 max-w-[85%] ${isModel ? "self-start" : "self-end flex-row-reverse"}`}
+                                    >
+                                      {isModel ? (
+                                        <div className="w-8 h-8 rounded-full bg-[#FFF250] neo-border-sm flex items-center justify-center text-black font-bold text-xs shrink-0 self-start">
+                                          FZ
+                                        </div>
+                                      ) : (
+                                        <div className="w-8 h-8 rounded-full bg-[#A855F7] neo-border-sm flex items-center justify-center text-white font-bold text-xs shrink-0 self-start">
+                                          ME
+                                        </div>
+                                      )}
+                                      <div
+                                        className={`p-3.5 neo-border-sm text-sm ${
+                                          isModel
+                                            ? "bg-white text-black neo-shadow-sm"
+                                            : "bg-neutral-900 text-white neo-shadow-sm"
+                                        }`}
+                                      >
+                                        {isModel ? (
+                                          <div className="prose prose-sm max-w-none text-neutral-800">
+                                            {formatFalizMessage(msg.content)}
+                                          </div>
+                                        ) : (
+                                          <p className="font-bold leading-relaxed">{msg.content}</p>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+
+                                {isFalizTyping && (
+                                  <div className="flex gap-3 self-start max-w-[85%] animate-pulse">
+                                    <div className="w-8 h-8 rounded-full bg-[#FFF250] neo-border-sm flex items-center justify-center text-black font-bold text-xs shrink-0">
+                                      FZ
+                                    </div>
+                                    <div className="p-3.5 neo-border-sm bg-white text-black neo-shadow-sm flex items-center gap-2">
+                                      <span className="font-mono text-xs font-black uppercase text-[#F97316]">
+                                        {language === "en" ? "Faliz AI is analyzing..." : "Faliz AI anachambua..."}
+                                      </span>
+                                      <span className="flex gap-1">
+                                        <span className="w-2.5 h-2.5 bg-black rounded-full animate-bounce delay-75"></span>
+                                        <span className="w-2.5 h-2.5 bg-black rounded-full animate-bounce delay-150"></span>
+                                        <span className="w-2.5 h-2.5 bg-black rounded-full animate-bounce delay-300"></span>
+                                      </span>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Form Control */}
+                              <form onSubmit={handleSendFalizMessage} className="flex gap-3">
+                                <input
+                                  type="text"
+                                  value={falizInput}
+                                  onChange={(e) => setFalizInput(e.target.value)}
+                                  placeholder={
+                                    language === "en"
+                                      ? `Ask about tips, emulator, cheats for ${activeGame.FileName}...`
+                                      : `Uliza kuhusu vidokezo, emulator, cheats za ${activeGame.FileName}...`
+                                  }
+                                  disabled={isFalizTyping}
+                                  className="flex-1 bg-white neo-border-sm p-3.5 text-sm font-semibold placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-[#F97316]"
+                                />
+                                <button
+                                  type="submit"
+                                  disabled={isFalizTyping || !falizInput.trim()}
+                                  className="bg-[#F97316] hover:bg-[#EA580C] disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black px-6 py-3.5 neo-border-sm neo-shadow-sm neo-shadow-hover flex items-center gap-2 uppercase tracking-wide cursor-pointer text-xs"
+                                >
+                                  <Send className="w-4 h-4" />
+                                  {language === "en" ? "ASK" : "ULIZA"}
+                                </button>
+                              </form>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* REAL-TIME COMMENTS SECTION */}
+                        {renderCommentsSection()}
                       </div>
 
                     </div>
@@ -1059,7 +2042,15 @@ export default function App() {
                                   }`}
                                   title={likes.includes(game.GameID) ? "Remove from Favorites" : "Add to Favorites"}
                                 >
-                                  <Heart className={`w-3.5 h-3.5 ${likes.includes(game.GameID) ? "fill-current" : ""}`} />
+                                  <motion.span
+                                    key={likes.includes(game.GameID) ? "liked" : "unliked"}
+                                    initial={{ scale: 1 }}
+                                    animate={{ scale: [1, 1.4, 0.9, 1.15, 1] }}
+                                    transition={{ duration: 0.35, ease: "easeOut" }}
+                                    className="inline-block"
+                                  >
+                                    <Heart className={`w-3.5 h-3.5 ${likes.includes(game.GameID) ? "fill-current text-white" : ""}`} />
+                                  </motion.span>
                                 </button>
 
                                 <img
@@ -1116,6 +2107,10 @@ export default function App() {
                                   <Star className="w-2.5 h-2.5 fill-[#FACC15] text-[#FACC15]" />
                                   {game.Rating}
                                 </span>
+                                <span className="bg-rose-50 px-2 py-0.5 font-bold text-[10px] uppercase neo-border-sm text-rose-800 flex items-center gap-1">
+                                  <Heart className="w-2.5 h-2.5 fill-rose-500 text-rose-500" />
+                                  {globalLikes[game.GameID] || 0}
+                                </span>
                               </div>
 
                               {/* Game Sub-description snippet */}
@@ -1151,6 +2146,8 @@ export default function App() {
                       )}
                     </div>
                   )}
+
+
 
                 </motion.div>
               )}
@@ -1326,6 +2323,45 @@ export default function App() {
             </div>
           </footer>
 
+        </div>
+      )}
+
+      {/* BAN NOTICE IF THE USER IS BANNED */}
+      {language !== null && isBanned && (
+        <div className="min-h-[85vh] flex items-center justify-center px-4 py-8">
+          <div className="w-full max-w-2xl bg-white text-black neo-border p-8 sm:p-12 neo-shadow-lg text-center flex flex-col items-center gap-6">
+            <div className="w-20 h-20 bg-[#EF4444] text-white neo-border rounded-full flex items-center justify-center neo-shadow-sm animate-bounce">
+              <AlertTriangle className="w-10 h-10" />
+            </div>
+            
+            <h1 className="text-3xl sm:text-5xl font-black uppercase tracking-tighter text-[#EF4444]">
+              {language === "en" ? "ACCESS SUSPENDED" : "HAKI YA KUFIKIA IMEFUTWA"}
+            </h1>
+            
+            <div className="font-mono text-sm uppercase tracking-widest bg-red-100 text-[#EF4444] px-4 py-1.5 font-bold neo-border-sm">
+              {language === "en" ? "Rule Violation: 3/3 Abusive Terms Detected" : "Ukiukaji wa Sheria: Maneno ya Matusi Mara 3/3"}
+            </div>
+
+            <p className="text-base sm:text-lg font-bold leading-relaxed text-neutral-800">
+              {language === "en" 
+                ? "Your account has been temporarily restricted from accessing Gamesiteonline for 1 hour. We maintain a friendly, family-safe retro community. Abusive or offensive language is strictly prohibited."
+                : "Akaunti yako imezuiwa kwa muda kutumia Gamesiteonline kwa saa 1. Tunadumisha jamii salama na ya kirafiki ya retro. Lugha ya matusi imepigwa marufuku kabisa."}
+            </p>
+
+            <div className="w-full bg-[#FFF250] neo-border p-6 flex flex-col items-center gap-2 neo-shadow">
+              <span className="font-mono text-[10px] font-black uppercase tracking-widest text-neutral-700">
+                {language === "en" ? "TIME REMAINING UNTIL UNBAN" : "MUDA ULIOBAKI HADI KUFUNGULIWA"}
+              </span>
+              <span className="font-mono text-4xl sm:text-5xl font-black tracking-tight text-black">
+                {formatTimeLeft(banTimeLeft)}
+              </span>
+            </div>
+
+            <div className="w-full border-t-2 border-black/10 pt-4 flex justify-between items-center text-xs font-mono text-neutral-500">
+              <span>GAMESITEONLINE SAFETY PROTOCOL</span>
+              <span>FAHAD MOHAMED 🇹🇿</span>
+            </div>
+          </div>
         </div>
       )}
     </div>
